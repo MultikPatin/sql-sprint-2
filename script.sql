@@ -1,29 +1,9 @@
--- Исходные таблицы
+CREATE EXTENSION IF NOT EXISTS PostGIS;
 
-CREATE TABLE raw_data.menu
-(
-    cafe_name VARCHAR(50),
-    menu      jsonb
-);
-CREATE TABLE raw_data.sales
-(
-    report_date   date,
-    cafe_name     VARCHAR(50),
-    type          VARCHAR(50),
-    avg_check     NUMERIC(6, 2),
-    manager       VARCHAR(50),
-    manager_phone VARCHAR(50),
-    latitude      double precision,
-    longitude     double precision
-);
-CREATE TABLE cafe.districts
-(
-    id            serial PRIMARY KEY,
-    district_name VARCHAR(255) NOT NULL,
-    district_geom GEOMETRY(Geometry, 4326)
-);
-
-CREATE EXTENSION PostGIS;
+DROP TABLE IF EXISTS cafe.sales;
+DROP TABLE IF EXISTS cafe.restaurant_manager_work_dates;
+DROP TABLE IF EXISTS cafe.managers;
+DROP TABLE IF EXISTS cafe.restaurants;
 
 
 -- Этап 1. Создание дополнительных таблиц
@@ -73,6 +53,70 @@ CREATE TABLE cafe.sales
     avg_check       NUMERIC(6, 2),
     PRIMARY KEY (date, restaurant_uuid)
 );
+
+
+-- Скрипт переноса данных из raw_data в таблицы схемы cafe
+
+
+-- 1. Заполнение таблицы cafe.restaurants
+
+INSERT INTO cafe.restaurants (name, type, menu, location)
+SELECT rd.cafe_name,
+       rd.type::cafe.restaurant_type,
+       rm.menu::jsonb,
+       ST_SetSRID(ST_MakePoint(rd.longitude, rd.latitude), 4326) AS location
+FROM raw_data.sales rd
+         LEFT JOIN raw_data.menu rm ON rd.cafe_name = rm.cafe_name
+WHERE NOT EXISTS (SELECT 1
+                  FROM cafe.restaurants r
+                  WHERE r.name = rd.cafe_name)
+GROUP BY rd.cafe_name, rd.type, rm.menu, rd.latitude, rd.longitude;
+
+-- 2. Заполнение таблицы cafe.managers
+
+INSERT INTO cafe.managers (name, phone)
+SELECT rd.manager,
+       rd.manager_phone
+FROM raw_data.sales rd
+WHERE rd.manager IS NOT NULL
+  AND NOT EXISTS (SELECT 1
+                  FROM cafe.managers m
+                  WHERE m.name = rd.manager)
+GROUP BY rd.manager, rd.manager_phone;
+
+-- 3. Заполнение таблицы cafe.restaurant_manager_work_dates
+
+INSERT INTO cafe.restaurant_manager_work_dates (restaurant_uuid, manager_uuid, start_date, end_date)
+WITH manager_periods AS (SELECT r.restaurant_uuid,
+                                m.manager_uuid,
+                                MIN(rd.report_date) AS start_date,
+                                MAX(rd.report_date) AS end_date
+                         FROM raw_data.sales rd
+                                  JOIN cafe.restaurants r ON rd.cafe_name = r.name
+                                  JOIN cafe.managers m ON rd.manager = m.name
+                         GROUP BY r.restaurant_uuid, m.manager_uuid)
+SELECT restaurant_uuid,
+       manager_uuid,
+       start_date,
+       end_date
+FROM manager_periods
+WHERE NOT EXISTS (SELECT 1
+                  FROM cafe.restaurant_manager_work_dates rw
+                  WHERE rw.restaurant_uuid = manager_periods.restaurant_uuid
+                    AND rw.manager_uuid = manager_periods.manager_uuid);
+
+-- 4. Заполнение таблицы cafe.sales
+
+INSERT INTO cafe.sales (date, restaurant_uuid, avg_check)
+SELECT rd.report_date AS date,
+       r.restaurant_uuid,
+       rd.avg_check
+FROM raw_data.sales rd
+         JOIN cafe.restaurants r ON rd.cafe_name = r.name
+WHERE NOT EXISTS (SELECT 1
+                  FROM cafe.sales s
+                  WHERE s.date = rd.report_date
+                    AND s.restaurant_uuid = r.restaurant_uuid);
 
 
 -- Этап 2. Создание представлений и написание аналитических запросов
